@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from collections import Counter
 from typing import Dict, List
 
+import numpy as np
+
 from .text_ca_schema import DEFAULT_NUMERIC_CHANNELS, TextCARunRecord, TextCellState
+
+# Import wolfram_classify from NADJA
+_NADJA_MATH = "/Users/gardenofcomputation/scenario-forward-investing-lab"
+if _NADJA_MATH not in sys.path:
+    sys.path.insert(0, _NADJA_MATH)
+from stock_simulator.math.wolfram_classify import classify_from_trajectory as _wolfram_classify
 
 
 def _read_channel_value(state: TextCellState, path: str) -> float:
@@ -115,6 +124,56 @@ def compute_compatibility_histogram(run: TextCARunRecord) -> Dict[str, int]:
     return dict(buckets)
 
 
+def binarize_trajectory(
+    run: TextCARunRecord,
+    channels: tuple[str, ...] | None = None,
+    threshold: float = 0.5,
+) -> List[np.ndarray]:
+    """Convert multi-channel text CA trajectory to binary for Wolfram classification.
+
+    Each step becomes a 1D binary array: one bit per (cell, channel) pair,
+    set to 1 if the channel value >= threshold, else 0.
+
+    Parameters
+    ----------
+    run : TextCARunRecord
+        A completed text CA run.
+    channels : tuple of str, optional
+        Numeric channel paths to binarize. Defaults to DEFAULT_NUMERIC_CHANNELS.
+    threshold : float
+        Value at or above which a channel is considered "on".
+
+    Returns
+    -------
+    List[np.ndarray]
+        Binary trajectory suitable for wolfram_classify.classify_from_trajectory.
+    """
+    channels = channels or DEFAULT_NUMERIC_CHANNELS
+    trajectory: List[np.ndarray] = []
+    for step_states in run.state_history:
+        bits: List[int] = []
+        for state in step_states:
+            for ch in channels:
+                val = _read_channel_value(state, ch)
+                bits.append(1 if val >= threshold else 0)
+        trajectory.append(np.array(bits, dtype=np.int64))
+    return trajectory
+
+
+def wolfram_classify_text_ca(
+    run: TextCARunRecord,
+    channels: tuple[str, ...] | None = None,
+    threshold: float = 0.5,
+) -> Dict:
+    """Classify a text CA run into Wolfram classes I-IV.
+
+    Binarizes the multi-channel semantic trajectory then delegates
+    to stock_simulator.math.wolfram_classify.classify_from_trajectory.
+    """
+    binary_traj = binarize_trajectory(run, channels=channels, threshold=threshold)
+    return _wolfram_classify(binary_traj)
+
+
 def analyze_text_ca_run(run: TextCARunRecord) -> Dict[str, object]:
     """Compute initial textual CA observables for a run."""
 
@@ -133,6 +192,8 @@ def analyze_text_ca_run(run: TextCARunRecord) -> Dict[str, object]:
     frame_diversity = [compute_frame_diversity(step_states) for step_states in run.state_history]
     compatibility_histogram = compute_compatibility_histogram(run)
 
+    wolfram = wolfram_classify_text_ca(run)
+
     return {
         "entropy_curve": entropy_curve,
         "mean_channels_by_step": mean_channels_by_step,
@@ -142,4 +203,10 @@ def analyze_text_ca_run(run: TextCARunRecord) -> Dict[str, object]:
         "frame_contagion_rate": frame_contagion_rate,
         "frame_diversity": frame_diversity,
         "compatibility_histogram": compatibility_histogram,
+        "wolfram_class": wolfram["wolfram_class"],
+        "wolfram_evidence": wolfram["evidence_scores"],
+        "wolfram_metrics": {
+            k: wolfram[k]
+            for k in ("entropy_rate", "lyapunov_estimate", "periodicity", "transient_length")
+        },
     }
