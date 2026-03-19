@@ -2,13 +2,51 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from collections import defaultdict
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from .lakoff_taxonomy import TAXONOMY
 from .text_ca_rules import DEFAULT_TEXT_CA_RULES, TextCARule, apply_state_updates, rule_matches
 from .text_ca_schema import TextCARunRecord, TextCellState
+
+logger = logging.getLogger(__name__)
+
+
+class _EmbeddingCache:
+    """Cache embeddings for a CA run, with graceful Ollama fallback."""
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, np.ndarray] = {}
+        self._available: Optional[bool] = None
+
+    def is_available(self) -> bool:
+        """Check if Ollama embedding service is reachable (cached check)."""
+        if self._available is not None:
+            return self._available
+        try:
+            from .embedding_similarity import embed_text
+            embed_text("test")
+            self._available = True
+        except Exception:
+            logger.warning("Ollama embedding unavailable — falling back to frame matching")
+            self._available = False
+        return self._available
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for text, using cache."""
+        if text not in self._cache:
+            from .embedding_similarity import embed_text
+            self._cache[text] = embed_text(text)
+        return self._cache[text]
+
+    def get_all_embeddings(self, states: Sequence[TextCellState]) -> np.ndarray:
+        """Get embeddings for all cell states as (N, dim) array."""
+        vecs = [self.get_embedding(s.cell.surface_text) for s in states]
+        return np.array(vecs)
 
 
 def _compute_text_cell_compatibility(cell_a: TextCellState, cell_b: TextCellState) -> float:
@@ -42,32 +80,51 @@ def _compute_text_cell_compatibility(cell_a: TextCellState, cell_b: TextCellStat
     return min(1.0, jaccard + cooccur_bonus)
 
 
+def _embedding_compatibility(
+    cell_a: TextCellState, cell_b: TextCellState, cache: _EmbeddingCache
+) -> float:
+    """Compute semantic compatibility via embeddings."""
+    from .embedding_similarity import semantic_compatibility
+    emb_a = cache.get_embedding(cell_a.cell.surface_text)
+    emb_b = cache.get_embedding(cell_b.cell.surface_text)
+    return semantic_compatibility(emb_a, emb_b)
+
+
 def build_local_neighborhood(
-    states: Sequence[TextCellState], index: int
+    states: Sequence[TextCellState],
+    index: int,
+    embedding_cache: Optional[_EmbeddingCache] = None,
 ) -> Dict[str, List[Tuple[TextCellState, float]]]:
     """Build a weighted neighborhood around one state.
 
     Returns dict mapping neighborhood type to list of (state, compatibility_weight) tuples.
+    When embedding_cache is provided, uses semantic similarity instead of frame matching.
     """
     state = states[index]
     thread_id = state.cell.coordinates.thread_id
     iteration = state.cell.coordinates.iteration
 
+    compat_fn = (
+        (lambda a, b: _embedding_compatibility(a, b, embedding_cache))
+        if embedding_cache is not None
+        else _compute_text_cell_compatibility
+    )
+
     neighborhood: Dict[str, List[Tuple[TextCellState, float]]] = defaultdict(list)
     # Sequence-adjacent cells get a minimum proximity weight of 0.55
     # to allow contagion even before shared frames develop
     if index > 0:
-        w = max(0.55, _compute_text_cell_compatibility(state, states[index - 1]))
+        w = max(0.55, compat_fn(state, states[index - 1]))
         neighborhood["prev_seq"].append((states[index - 1], w))
     if index + 1 < len(states):
-        w = max(0.55, _compute_text_cell_compatibility(state, states[index + 1]))
+        w = max(0.55, compat_fn(state, states[index + 1]))
         neighborhood["next_seq"].append((states[index + 1], w))
 
     for other in states:
         if other is state:
             continue
         if other.cell.coordinates.thread_id == thread_id and other.cell.coordinates.iteration == iteration:
-            w = _compute_text_cell_compatibility(state, other)
+            w = compat_fn(state, other)
             neighborhood["same_thread_window"].append((other, w))
 
     return dict(neighborhood)
@@ -247,15 +304,32 @@ def step_text_ca(
     states: Sequence[TextCellState],
     rules: Sequence[TextCARule] | None = None,
     rng: random.Random | None = None,
+    use_embeddings: bool = False,
+    _embedding_cache: Optional[_EmbeddingCache] = None,
 ) -> tuple[List[TextCellState], List[str]]:
-    """Advance all cells by one synchronous CA step."""
+    """Advance all cells by one synchronous CA step.
+
+    Args:
+        use_embeddings: Use embedding-based semantic similarity instead of frame matching.
+        _embedding_cache: Internal cache object (created automatically if use_embeddings=True).
+    """
 
     active_rules = list(rules) if rules is not None else DEFAULT_TEXT_CA_RULES
     next_states: List[TextCellState] = []
     fired_rule_ids: List[str] = []
 
+    # Resolve embedding cache
+    ecache: Optional[_EmbeddingCache] = None
+    if use_embeddings:
+        if _embedding_cache is not None and _embedding_cache.is_available():
+            ecache = _embedding_cache
+        elif _embedding_cache is None:
+            ecache = _EmbeddingCache()
+            if not ecache.is_available():
+                ecache = None
+
     for index, state in enumerate(states):
-        neighborhood = build_local_neighborhood(states, index)
+        neighborhood = build_local_neighborhood(states, index, embedding_cache=ecache)
         applicable = [rule for rule in active_rules if rule_matches(rule, state, neighborhood)]
 
         # Sort by confidence * rule-cell compatibility, apply top 3
@@ -283,20 +357,56 @@ def simulate_text_ca(
     rules: Sequence[TextCARule] | None = None,
     run_id: str = "text_ca_run",
     seed: int | None = None,
+    use_embeddings: bool = False,
 ) -> TextCARunRecord:
-    """Run a textual CA for a fixed number of synchronous steps."""
+    """Run a textual CA for a fixed number of synchronous steps.
+
+    Args:
+        use_embeddings: Use embedding-based semantic similarity (requires Ollama).
+                        Falls back to frame matching if Ollama is unavailable.
+    """
 
     rng = random.Random(seed) if seed is not None else random.Random()
     history: List[List[TextCellState]] = [list(initial_states)]
     fired_per_step: List[List[str]] = []
     realized_text_by_step: List[List[str]] = [[state.cell.surface_text for state in initial_states]]
 
+    # Set up embedding cache once for the whole run
+    embedding_cache: Optional[_EmbeddingCache] = None
+    embeddings_active = False
+    if use_embeddings:
+        embedding_cache = _EmbeddingCache()
+        embeddings_active = embedding_cache.is_available()
+
+    # Track embeddings per step for drift computation
+    trajectory_embeddings: List[np.ndarray] = []
+    if embeddings_active and embedding_cache is not None:
+        trajectory_embeddings.append(embedding_cache.get_all_embeddings(initial_states))
+
     current = list(initial_states)
     for _ in range(steps):
-        current, fired_rule_ids = step_text_ca(current, rules, rng=rng)
+        current, fired_rule_ids = step_text_ca(
+            current, rules, rng=rng,
+            use_embeddings=use_embeddings,
+            _embedding_cache=embedding_cache,
+        )
         history.append(current)
         fired_per_step.append(fired_rule_ids)
         realized_text_by_step.append([state.cell.surface_text for state in current])
+        if embeddings_active and embedding_cache is not None:
+            trajectory_embeddings.append(embedding_cache.get_all_embeddings(current))
+
+    # Compute semantic drift metrics
+    metrics: Dict[str, float] = {}
+    if embeddings_active and len(trajectory_embeddings) >= 2:
+        from .embedding_similarity import compute_semantic_drift, semantic_entropy
+        drift = compute_semantic_drift(trajectory_embeddings)
+        metrics["semantic_drift_mean"] = float(np.mean(drift))
+        metrics["semantic_drift_max"] = float(np.max(drift))
+        for i, d in enumerate(drift):
+            metrics[f"semantic_drift_cell_{i}"] = float(d)
+        # Final-step entropy
+        metrics["semantic_entropy_final"] = semantic_entropy(trajectory_embeddings[-1])
 
     return TextCARunRecord(
         run_id=run_id,
@@ -305,4 +415,5 @@ def simulate_text_ca(
         state_history=history,
         fired_rule_ids=fired_per_step,
         realized_text_by_step=realized_text_by_step,
+        metrics=metrics,
     )
